@@ -1,1 +1,10 @@
+# Python
+__pycache__/
+.venv/
+
+# Generated output and caches
+report.html
+tile_cache/
+
+# Go build output
 traceviz-web
