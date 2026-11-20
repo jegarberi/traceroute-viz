@@ -1,17 +1,21 @@
-// traceviz-web: serve an HTML report generated from traceroute.db.
+// traceviz-web: serve the traceroute.db report as tabs, mirroring the GTK viewer (gtk_app.py).
 // Read-only: the database is opened with mode=ro.
+//
+// Filters are query parameters, like the GTK header bar:
+//
+//	/?dest=<ip id>&window=<seconds, 0 = all time>&unk=show|hide-multi|hide-all
 package main
 
 import (
+	"bytes"
 	"database/sql"
-	"encoding/binary"
 	"flag"
 	"fmt"
 	"html/template"
 	"log"
-	"net"
 	"net/http"
-	"strings"
+	"path/filepath"
+	"strconv"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -19,181 +23,181 @@ import (
 
 var defaultDB = "/home/jon/CLionProjects/traceroute/traceroute.db"
 
-type dest struct {
-	Label  string
-	Traces int
-	Routes int
-	Last   string
+var windowOptions = []struct {
+	secs  int64
+	label string
+}{{0, "all time"}, {3600, "last 1h"}, {1800, "last 30m"}, {600, "last 10m"}}
+
+type option struct {
+	Value, Label string
+	Selected     bool
 }
 
-type route struct {
-	Dest string
-	Hops string
-	N    int
+type card struct{ Label, Value string }
+
+type tab struct {
+	ID, Title string
+	Body      template.HTML
 }
 
-type report struct {
-	Traces, Destinations, IPs, Routes int
-	SpanHours                         string
-	Dests                             []dest
-	TopRoutes                         []route
-	Generated                         string
+type pageData struct {
+	Source, Generated string
+	DestOpts          []option
+	WindowOpts        []option
+	UnkOpts           []option
+	Status, Error     string
+	Cards             []card
+	Tabs              []tab
+	CSS               template.CSS
+	JS                template.JS
 }
 
-// ipString turns the uint32 stored in ips.ip into dotted quad; id 0 / ip 0 is "*".
-func ipString(v uint32) string {
-	if v == 0 {
-		return "*"
+func parseID(q string) (int64, bool) {
+	if q == "" {
+		return 0, false
 	}
-	b := make([]byte, 4)
-	binary.BigEndian.PutUint32(b, v)
-	return net.IP(b).String()
+	v, err := strconv.ParseInt(q, 10, 64)
+	return v, err == nil
 }
 
-func build(db *sql.DB) (*report, error) {
-	r := &report{Generated: time.Now().Format("2006-01-02 15:04:05")}
-	var t0, t1 sql.NullInt64
+type server struct {
+	db     *sql.DB
+	dbPath string
+	geo    *geoReaders
+	zoom   int
+}
 
-	if err := db.QueryRow(`SELECT COUNT(*), MIN(ts), MAX(ts) FROM tracerts`).Scan(&r.Traces, &t0, &t1); err != nil {
-		return nil, err
+func (s *server) handle(w http.ResponseWriter, req *http.Request) {
+	if req.URL.Path != "/" {
+		http.NotFound(w, req)
+		return
 	}
-	if t1.Valid && t0.Valid {
-		r.SpanHours = fmt.Sprintf("%.1f", float64(t1.Int64-t0.Int64)/3600)
-	}
-	if err := db.QueryRow(`SELECT COUNT(*) FROM ips`).Scan(&r.IPs); err != nil {
-		return nil, err
-	}
-	if err := db.QueryRow(`SELECT COUNT(DISTINCT path_id) FROM tracerts`).Scan(&r.Routes); err != nil {
-		return nil, err
-	}
-
-	// Hop id -> display string.
-	ips := map[string]string{}
-	rows, err := db.Query(`SELECT id, ip FROM ips`)
+	raw, err := loadRaw(s.db)
 	if err != nil {
-		return nil, err
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
-	for rows.Next() {
-		var id int64
-		var ip uint32
-		if err := rows.Scan(&id, &ip); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		ips[fmt.Sprint(id)] = ipString(ip)
-	}
-	rows.Close()
+	q := req.URL.Query()
 
-	// Path id -> hop list.
-	paths := map[int64]string{}
-	rows, err = db.Query(`SELECT path_id, path FROM paths`)
+	// Destination and window choices, relative to the unfiltered data (as the GTK header does).
+	destIDs := map[int64]bool{}
+	var destList []int64
+	for _, t := range raw.traces {
+		if !destIDs[t.dest] {
+			destIDs[t.dest] = true
+			destList = append(destList, t.dest)
+		}
+	}
+	sortInt64(destList)
+
+	f := filter{}
+	selDest, hasSel := parseID(q.Get("dest"))
+	if hasSel && destIDs[selDest] {
+		f.dest, f.hasDest = selDest, true
+	} else {
+		selDest = 0
+	}
+	data := pageData{Source: s.dbPath, Generated: time.Now().Format("2006-01-02 15:04")}
+	data.DestOpts = []option{{Value: "", Label: "All destinations", Selected: !f.hasDest}}
+	for _, d := range destList {
+		data.DestOpts = append(data.DestOpts, option{
+			Value: fmt.Sprint(d), Label: raw.fmtIP(d), Selected: f.hasDest && d == f.dest})
+	}
+
+	window, _ := parseID(q.Get("window"))
+	for _, w := range windowOptions {
+		data.WindowOpts = append(data.WindowOpts, option{
+			Value: fmt.Sprint(w.secs), Label: w.label, Selected: w.secs == window})
+		if w.secs == window && w.secs > 0 && len(raw.traces) > 0 {
+			f.t0, f.hasT0 = raw.traces[len(raw.traces)-1].ts-w.secs, true
+		}
+	}
+
+	unk := q.Get("unk")
+	if unk == "" {
+		unk = "show"
+	}
+	for _, m := range unknownModes {
+		data.UnkOpts = append(data.UnkOpts, option{Value: m.key, Label: m.label, Selected: m.key == unk})
+	}
+
+	A, err := analyze(raw, f, s.geo.lookup(raw.ips))
 	if err != nil {
-		return nil, err
-	}
-	for rows.Next() {
-		var pid int64
-		var p string
-		if err := rows.Scan(&pid, &p); err != nil {
-			rows.Close()
-			return nil, err
+		data.Error = err.Error() // keep the page usable; the filters still show
+	} else {
+		data.Status = fmt.Sprintf("%d traces · %d destinations · %d route changes",
+			A.nTraces, len(A.dests), len(A.events))
+		data.Cards = []card{
+			{"Traces", fmt.Sprint(A.nTraces)},
+			{"Destinations", fmt.Sprint(len(A.dests))},
+			{"IPs seen", fmt.Sprint(A.ipCount)},
+			{"Distinct routes", fmt.Sprint(A.routesTot)},
+			{"Route changes", fmt.Sprint(len(A.events))},
+			{"Time span", fmt.Sprintf("%.1f h", float64(A.t1-A.t0)/3600)},
 		}
-		var names []string
-		for _, h := range strings.Split(p, ",") {
-			if h == "" {
-				continue
-			}
-			names = append(names, ips[h])
-		}
-		paths[pid] = strings.Join(names, " → ")
+		data.Tabs = s.tabs(A, unk)
 	}
-	rows.Close()
+	data.CSS = template.CSS(pageCSS)
+	data.JS = template.JS(pageJS)
 
-	// Per destination: trace count, distinct routes, last seen.
-	rows, err = db.Query(`
-		SELECT ip_destination_id, COUNT(*), COUNT(DISTINCT path_id), MAX(ts)
-		FROM tracerts GROUP BY ip_destination_id ORDER BY COUNT(*) DESC`)
-	if err != nil {
-		return nil, err
+	var buf bytes.Buffer
+	if err := pageTmpl.Execute(&buf, data); err != nil {
+		log.Print(err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
-	for rows.Next() {
-		var id int64
-		var d dest
-		var last int64
-		if err := rows.Scan(&id, &d.Traces, &d.Routes, &last); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		d.Label = ips[fmt.Sprint(id)]
-		d.Last = time.Unix(last, 0).Format("2006-01-02 15:04")
-		r.Dests = append(r.Dests, d)
-	}
-	rows.Close()
-	r.Destinations = len(r.Dests)
-
-	// Most-used routes.
-	rows, err = db.Query(`
-		SELECT ip_destination_id, path_id, COUNT(*) AS n
-		FROM tracerts GROUP BY ip_destination_id, path_id ORDER BY n DESC LIMIT 20`)
-	if err != nil {
-		return nil, err
-	}
-	for rows.Next() {
-		var dst, pid int64
-		var rt route
-		if err := rows.Scan(&dst, &pid, &rt.N); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		rt.Dest = ips[fmt.Sprint(dst)]
-		rt.Hops = paths[pid]
-		r.TopRoutes = append(r.TopRoutes, rt)
-	}
-	rows.Close()
-
-	return r, nil
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write(buf.Bytes())
 }
 
-var page = template.Must(template.New("report").Parse(`<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Traceroute report</title>
-<style>
-body{font:14px/1.4 system-ui,sans-serif;margin:16px;background:#fafafa;color:#222}
-h1{font-size:20px} h2{font-size:16px;margin-top:24px}
-.cards{display:flex;flex-wrap:wrap;gap:8px}
-.card{background:#fff;border:1px solid #ddd;border-radius:6px;padding:8px 12px}
-.card span{display:block;color:#777;font-size:12px}
-table{border-collapse:collapse;width:100%;background:#fff;font-size:13px}
-th,td{border:1px solid #ddd;padding:4px 8px;text-align:left;vertical-align:top}
-th{background:#f0f0f0} .hops{font-family:monospace;word-break:break-word}
-.muted{color:#888;font-size:12px}
-</style></head><body>
-<h1>Traceroute report</h1>
-<div class="cards">
- <div class="card"><span>Traces</span><b>{{.Traces}}</b></div>
- <div class="card"><span>Destinations</span><b>{{.Destinations}}</b></div>
- <div class="card"><span>IPs seen</span><b>{{.IPs}}</b></div>
- <div class="card"><span>Distinct routes</span><b>{{.Routes}}</b></div>
- <div class="card"><span>Time span</span><b>{{.SpanHours}} h</b></div>
-</div>
+func (s *server) tabs(A *analysis, unk string) []tab {
+	noGeo := ""
+	if len(A.geo) == 0 {
+		noGeo = `<p class="muted">No GeoIP data: pass --geo-dir with GeoLite2-City.mmdb / GeoLite2-ASN.mmdb.</p>`
+	}
+	return []tab{
+		{"destinations", "Destinations", template.HTML(A.destTable())},
+		{"world-map", "World map", template.HTML(noGeo +
+			`<p class="muted">Located IPs (GeoLite2 City, approximate to city level). Map tiles: OpenStreetMap. ` +
+			`Red = destination. Lines = hop-to-hop links, thicker = more traces. Private addresses have no location.</p>` +
+			`<div class="wrap">` + A.mapSVG(s.zoom) + `</div>`)},
+		{"route-timeline", "Route timeline", template.HTML(
+			`<p class="muted">Each dot is one traceroute. Colour is the route (non-* hops); a colour change along a row ` +
+				`is a route change. Grey = no replies.</p><div class="wrap">` + A.timelineSVG() + `</div>`)},
+		{"hop-graph", "Hop graph", template.HTML(
+			`<p class="muted">Nodes are IPs, dashed grey nodes are unknown hops. Each column is the average position ` +
+				`along the paths; edges are consecutive hops, thicker = more traces. Change "Unknown hops" in the ` +
+				`filters above to hide * runs.</p><div class="wrap">` + A.graphSVG(unk) + `</div>`)},
+		{"graph-nodes", "Graph nodes", template.HTML(A.graphTable(unk))},
+		{"routes", "Routes", template.HTML(A.routesTable())},
+		{"changes", "Changes", template.HTML(
+			`<p class="muted">A change is a consecutive trace to the same destination whose non-* hops differ.</p>` +
+				A.changesTable())},
+		{"ips", "IPs", template.HTML(A.ipTable())},
+	}
+}
 
-<h2>Destinations</h2>
-<table><tr><th>Destination</th><th>Traces</th><th>Routes</th><th>Last seen</th></tr>
-{{range .Dests}}<tr><td>{{.Label}}</td><td>{{.Traces}}</td><td>{{.Routes}}</td><td>{{.Last}}</td></tr>
-{{end}}</table>
-
-<h2>Most used routes</h2>
-<table><tr><th>Destination</th><th>Count</th><th>Hops</th></tr>
-{{range .TopRoutes}}<tr><td>{{.Dest}}</td><td>{{.N}}</td><td class="hops">{{.Hops}}</td></tr>
-{{end}}</table>
-
-<p class="muted">Generated {{.Generated}}</p>
-</body></html>`))
+func sortInt64(a []int64) {
+	for i := 1; i < len(a); i++ {
+		for j := i; j > 0 && a[j] < a[j-1]; j-- {
+			a[j], a[j-1] = a[j-1], a[j]
+		}
+	}
+}
 
 func main() {
 	dbPath := flag.String("db", defaultDB, "path to traceroute.db (opened read-only)")
+	geoDir := flag.String("geo-dir", "", "directory with GeoLite2-City.mmdb / GeoLite2-ASN.mmdb (default: directory of -db)")
+	zoom := flag.Int("map-zoom", 2, "OpenStreetMap zoom for the world map (0-4)")
 	addr := flag.String("addr", ":8080", "listen address")
 	flag.Parse()
+
+	if *zoom < 0 || *zoom > 4 {
+		log.Fatal("-map-zoom must be between 0 and 4")
+	}
+	if *geoDir == "" {
+		*geoDir = filepath.Dir(*dbPath)
+	}
 
 	// mode=ro: the server never writes to the database.
 	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?mode=ro", *dbPath))
@@ -204,22 +208,11 @@ func main() {
 	if err := db.Ping(); err != nil {
 		log.Fatal(err)
 	}
+	geo := openGeo(*geoDir)
+	defer geo.close()
 
-	http.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
-		if req.URL.Path != "/" {
-			http.NotFound(w, req)
-			return
-		}
-		r, err := build(db)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		if err := page.Execute(w, r); err != nil {
-			log.Print(err)
-		}
-	})
+	s := &server{db: db, dbPath: *dbPath, geo: geo, zoom: *zoom}
+	http.HandleFunc("/", s.handle)
 
 	log.Printf("serving %s (read-only) on %s", *dbPath, *addr)
 	log.Fatal(http.ListenAndServe(*addr, nil))
